@@ -90,19 +90,20 @@ class NonAffineBatchNorm(nn.BatchNorm2d): #いったんここは使わないが�
         super(NonAffineBatchNorm, self).__init__(dim, affine=False)
 
 class Net(nn.Module):
-    def __init__(self):
+    def __init__(self, args):
         super(Net, self).__init__()
-        self.conv1 = SupermaskConv(1, 32, 3, 1, bias=False)
+        # SupermaskConv: in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias
+        # SupermaskLinear: in_features, out_features, bias
+        self.conv1 = SupermaskConv(3, 32, 3, 1, bias=False) 
         self.conv2 = SupermaskConv(32, 64, 3, 1, bias=False)
         self.dropout1 = nn.Dropout2d(0.25)
-        self.dropout2 = nn.Dropout2d(0.5)
-        self.fc1 = SupermaskLinear(9216, 128, bias=False)  #変更箇所 入力と出力が一致する隠れ層を何段か追加
-        
-        self.fc2 = SupermaskLinear(128, 128, bias=False)  #追加された隠れ層
-        self.fc3 = SupermaskLinear(128, 128, bias=False)  #変更箇所 出力層を追加
-        self.fc4 = SupermaskLinear(128, 128, bias=False)
-        
-        self.fc5 = SupermaskLinear(128, 10, bias=False)
+        self.dropout2 = nn.Dropout(0.05)
+        self.fc0 = SupermaskLinear(64 * 14 * 14, args.linear_size, bias=False)  #変更箇所 入力と出力が一致する隠れ層を何段か追加
+ 
+        self.fcList = nn.ModuleList()  # nn.ModuleListを使って可変長の層を保持するリストを作成
+        for layer in range(args.hidden_layer):
+            self.fcList.append(SupermaskLinear(args.linear_size, args.linear_size, bias=False))  #それぞれが層
+        self.fcLast = SupermaskLinear(args.linear_size, 10, bias=False)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -111,19 +112,14 @@ class Net(nn.Module):
         x = F.max_pool2d(x, 2)
         x = self.dropout1(x)
         x = torch.flatten(x, 1)
-        x = self.fc1(x)
+        x = self.fc0(x)
         x = F.relu(x)
         x = self.dropout2(x)
-        x = self.fc2(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        x = self.fc3(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        x = self.fc4(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        x = self.fc5(x)
+        for fc in self.fcList:
+            x = fc(x)
+            x = F.relu(x)
+            x = self.dropout2(x)
+        x = self.fcLast(x)
         output = F.log_softmax(x, dim=1)
         return output
 
@@ -165,7 +161,7 @@ def test(model, device, criterion, test_loader):
 def main():
     global args
     # Training settings
-    parser = argparse.ArgumentParser(description='PyTorch MNIST Example')
+    parser = argparse.ArgumentParser(description='PyTorch CIFAR-10 Example')
     parser.add_argument('--batch-size', type=int, default=64, metavar='N',
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
@@ -187,9 +183,14 @@ def main():
 
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
-    parser.add_argument('--data', type=str, default='../data/mnist/MNIST/raw', help='Location to store data')
+    parser.add_argument('--data', type=str, default='../data', help='Location to store data')
     parser.add_argument('--sparsity', type=float, default=0.5,
                         help='how sparse is each layer')
+    parser.add_argument("--linear-size", type=int, default=128, metavar="N",
+                        help="linear size (default: 128)")
+    parser.add_argument('--hidden-layer', type=int, default=4, metavar='N',
+                        help='number of hidden layers (default: 4)')
+    
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
@@ -199,20 +200,20 @@ def main():
 
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
     train_loader = torch.utils.data.DataLoader(
-        datasets.MNIST(os.path.join(args.data, 'mnist'), train=True, download=True,
+        datasets.CIFAR10(os.path.join(args.data, 'cifar10'), train=True, download=True,
                        transform=transforms.Compose([
                            transforms.ToTensor(),
-                           transforms.Normalize((0.1307,), (0.3081,))
+                           transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
                        ])),
         batch_size=args.batch_size, shuffle=True, **kwargs)
     test_loader = torch.utils.data.DataLoader(
-        datasets.MNIST(os.path.join(args.data, 'mnist'), train=False, transform=transforms.Compose([
+        datasets.CIFAR10(os.path.join(args.data, 'cifar10'), train=False, transform=transforms.Compose([
                            transforms.ToTensor(),
-                           transforms.Normalize((0.1307,), (0.3081,))
+                           transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
                        ])),
         batch_size=args.test_batch_size, shuffle=True, **kwargs)
 
-    model = Net().to(device)
+    model = Net(args).to(device)
     # NOTE: only pass the parameters where p.requires_grad == True to the optimizer! Important!
     optimizer = optim.SGD(
         [p for p in model.parameters() if p.requires_grad],
@@ -228,7 +229,7 @@ def main():
         scheduler.step()
 
     if args.save_model:
-        torch.save(model.state_dict(), "mnist_cnn.pt")
+        torch.save(model.state_dict(), "cifar10_cnn.pt")
 
 
 if __name__ == '__main__':
