@@ -19,19 +19,36 @@ args = None
 class GetSubnet(autograd.Function):# autograd.Functionを継承して、GetSubnetクラス定義 スコアに基づいてサブネットを取得するためのカスタム関数
     @staticmethod
     def forward(ctx, scores, k):
-        # Get the supermask by sorting the scores and using the top k%
-        out = scores.clone()
-        _, idx = scores.flatten().sort() #scoreをフラット化してソート 
-        # .sort()は ソートした値, 元のインデックスを返すがインデックスのみ使用 (3,1,2) -> (1,2,3), (1,2,0) となる 
-        j = int((1 - k) * scores.numel()) #socres.numel()はテンソルの要素数を返すため1-k%のインデックスを計算
+        # contiguousを付けて、必ず連続テンソルにする
+        out = scores.clone().contiguous()
 
-        # flat_out and out access the same memory.　#シャローコピー
-        flat_out = out.flatten()
+        # 順位を取得
+        _, idx = scores.flatten().sort()
+
+        j = int((1 - k) * scores.numel())
+
+        # outと必ずメモリを共有する1次元ビュー
+        flat_out = out.view(-1)
+
         flat_out[idx[:j]] = 0
         flat_out[idx[j:]] = 1
 
         return out
-        #返り値は、スコアの上位k%に対応する要素が1、それ以外が0のマスクテンソル score形状
+    # @staticmethod
+    # def forward(ctx, scores, k):
+    #     # Get the supermask by sorting the scores and using the top k%
+    #     out = scores.clone()
+    #     _, idx = scores.flatten().sort() #scoreをフラット化してソート 
+    #     # .sort()は ソートした値, 元のインデックスを返すがインデックスのみ使用 (3,1,2) -> (1,2,3), (1,2,0) となる 
+    #     j = int((1 - k) * scores.numel()) #socres.numel()はテンソルの要素数を返すため1-k%のインデックスを計算
+
+    #     # flat_out and out access the same memory.　#シャローコピー
+    #     flat_out = out.flatten()
+    #     flat_out[idx[:j]] = 0
+    #     flat_out[idx[j:]] = 1
+
+    #     return out
+    #     #返り値は、スコアの上位k%に対応する要素が1、それ以外が0のマスクテンソル score形状
 
     @staticmethod
     def backward(ctx, g):
@@ -83,34 +100,6 @@ class SupermaskLinear(nn.Linear): # nn.Linearを継承して、SupermaskLinear�
         w = self.weight * subnet
         return F.linear(x, w, self.bias)
         return x
-   
-class GetSubnetSecondOrder(autograd.Function):# autograd.Functionを継承して、GetSubnetクラス定義 スコアに基づいてサブネットを取得するためのカスタム関数
-    @staticmethod
-    def forward(ctx, scores, k, hidden_layer):
-        # Get the supermask by sorting the scores and using the top k%
-        out = scores.clone()
-
-        _, idx = scores.flatten().sort() #scoreをフラット化してソート 
-        # .sort()は ソートした値, 元のインデックスを返すがインデックスのみ使用 (3,1,2) -> (1,2,3), (1,2,0) となる 
-        j = int((1 - k) * scores.numel()) #socres.numel()はテンソルの要素数を返すため1-k%のインデックスを計算
-
-        # flat_out and out access the same memory.　#シャローコピー
-        flat_out = out.flatten()
-        flat_out.reshape(-1, hidden_layer)
-        for i in range(hidden_layer):
-            if i == 0:
-                flat_out[idx[:j]] = 0
-                flat_out[idx[j:]] = 1
-        flat_out[idx[:j]] = 0
-        flat_out[idx[j:]] = 1
-
-        return out
-        #返り値は、スコアの上位k%に対応する要素が1、それ以外が0のマスクテンソル score形状
-
-    @staticmethod
-    def backward(ctx, g):
-        # send the gradient g straight-through on the backward pass. マスクは勾配に影響を与えない
-        return g, None
  
 
 class SecondOrderSupermaskLinear(nn.Linear): # nn.Linearを継承して、SupermaskLinearクラス定義 スコアに基づいてサブネットを取得するためのカスタム全結合層
@@ -119,8 +108,9 @@ class SecondOrderSupermaskLinear(nn.Linear): # nn.Linearを継承して、Superm
         super().__init__(*args, **kwargs)
 
         # initialize the scores
-        self.solo_scores = nn.Parameter(torch.Tensor(self.weight.size()))
-        self.interaction_scores = nn.Parameter(torch.Tensor(self.weight.size())) # 初期値0なのでこのまま
+        self.solo_scores = nn.Parameter(torch.Tensor(self.weight.size())) 
+        self.interaction_scores = nn.Parameter(torch.zeros(self.weight.size()[0], self.weight.size()[0], self.weight.size()[0])) #0初期化
+        #interaction_scoresはx_ijk => 一層前のi からjへの辺が次のjからkへの辺に影響するかどうかを表すスコア
         nn.init.kaiming_uniform_(self.solo_scores, a=math.sqrt(5))
 
         # NOTE: initialize the weights like this.
@@ -129,10 +119,52 @@ class SecondOrderSupermaskLinear(nn.Linear): # nn.Linearを継承して、Superm
         # NOTE: turn the gradient on the weights off
         self.weight.requires_grad = False
 
-    def forward(self, x):
-        subnet = GetSubnetSecondOrder.apply(self.solo_scores.abs(), args.sparsity, args.hidden_layer)
+    def forward(self, x, pre_subnet):
+        # pre_layer: s*sのマスクテンソル　x_ijは前の層のiからjへのスコア
+        # masked_interaction_scores = pre_layer_mask * self.interaction_scores #(s * (s*s*s))=> s*sにする 
+        # scores = self.solo_scores + masked_interaction_scores # s + (s*s) => sにする
+        self.saved_input = x.detach() #順伝搬で値更新をしない 
+        fixed_pre_subnet = pre_subnet.detach()
+        masked_interaction_scores = torch.einsum("ji,ijk->kj", fixed_pre_subnet, self.interaction_scores) #TODO <- これでいけるらしい 後でちゃんと記法の理解
+        active_count = fixed_pre_subnet.sum(dim=1).clamp_min(1.0)
+
+        masked_interaction_scores = (
+            masked_interaction_scores
+            / active_count.unsqueeze(0)
+        )
+        scores = masked_interaction_scores*args.quad_scale +  self.solo_scores.abs()
+        subnet = GetSubnet.apply(scores.detach(), args.sparsity)
+        
+        #以下テスト用
+        with torch.no_grad():
+            solo_subnet = GetSubnet.apply(
+                self.solo_scores.abs(),
+                args.sparsity
+            )
+
+            # 二次項を入れたことで何個のマスクが変わったか
+            self.mask_diff = (
+                subnet != solo_subnet
+            ).sum().item()
+
+            # 単独項と二次項の平均的な大きさ
+            self.solo_mean = (
+                self.solo_scores.abs().mean().item()
+            )
+
+            self.interaction_mean = (
+                masked_interaction_scores.abs().mean().item()
+            )
         w = self.weight * subnet
-        return F.linear(x, w, self.bias)
+        output = F.linear(x, w, self.bias)
+
+        # loss.backward() 後に δL/δI を取得するため
+        if self.training and output.requires_grad:
+            output.retain_grad()
+
+        self.saved_output = output
+
+        return output, subnet
 
 # NOTE: not used here but we use NON-AFFINE Normalization!
 # So there is no learned parameters for your nomralization layer.
@@ -148,7 +180,7 @@ class Net(nn.Module):
         self.conv1 = SupermaskConv(3, 32, 3, 1, bias=False) 
         self.conv2 = SupermaskConv(32, 64, 3, 1, bias=False)
         self.dropout1 = nn.Dropout2d(0.25)
-        self.dropout2 = nn.Dropout(0.5)
+        self.dropout2 = nn.Dropout(0.05)
         self.fc0 = SupermaskLinear(64 * 14 * 14, args.linear_size, bias=False)  #変更箇所 入力と出力が一致する隠れ層を何段か追加
  
         self.fcList = nn.ModuleList()  # nn.ModuleListを使って可変長の層を保持するリストを作成
@@ -166,13 +198,105 @@ class Net(nn.Module):
         x = self.fc0(x)
         x = F.relu(x)
         x = self.dropout2(x)
+        pre_subnet = torch.zeros_like(self.fcList[0].weight)
         for fc in self.fcList:
-            x = fc(x)
+            x, pre_subnet = fc(x, pre_subnet=pre_subnet)  # ここではpre_layer_maskは使用しない
             x = F.relu(x)
             x = self.dropout2(x)
         x = self.fcLast(x)
         output = F.log_softmax(x, dim=1)
         return output
+    
+@torch.no_grad()
+def set_custom_score_gradients(model):
+    """
+    solo:
+        dL/ds_solo[k,j]
+        = sum_b dL/dI[b,k] * w[k,j] * Z[b,j]
+
+    interaction:
+        dL/ds_intera[i,j,k]
+        = sum_b dL/dI[b,k]
+          * w_prev[j,i]
+          * w_current[k,j]
+          * Z_prev[b,i]
+    """
+
+    for layer_idx, current_fc in enumerate(model.fcList):
+        # δL/δI_k
+        # current_fcの線形出力、ReLU前の勾配
+        delta_k = current_fc.saved_output.grad
+
+        if delta_k is None:
+            raise RuntimeError(
+                f"fcList[{layer_idx}].saved_output.grad is None"
+            )
+
+        delta_k = delta_k.detach()          # [batch, k]
+
+        # =================================================
+        # solo_scores の勾配
+        # =================================================
+
+        z_j = current_fc.saved_input        # [batch, j]
+        w_kj = current_fc.weight.detach()   # [k, j]
+
+        solo_grad = torch.einsum(
+            "bk,kj,bj->kj",
+            delta_k,
+            w_kj,
+            z_j
+        )
+
+        solo_grad = (
+            current_fc.solo_scores.detach().sign()
+            * solo_grad
+        )
+
+        current_fc.solo_scores.grad = solo_grad.clone()
+
+        # =================================================
+        # interaction_scores の勾配
+        # =================================================
+
+        # fcList[0]には、その前のfcList層が存在しない
+        if layer_idx == 0:
+            current_fc.interaction_scores.grad = None
+            continue
+
+        previous_fc = model.fcList[layer_idx - 1]
+
+        # 経路 i -> j -> k
+        z_i = previous_fc.saved_input       # [batch, i]
+        w_ji = previous_fc.weight.detach()  # [j, i]
+        w_kj = current_fc.weight.detach()   # [k, j]
+
+        # 前の層のReLU前出力
+        preactivation_j = previous_fc.saved_output.detach()
+
+        # ReLUの微分
+        relu_gate_j = (
+            preactivation_j > 0
+        ).to(delta_k.dtype)
+
+        interaction_grad = torch.einsum(
+            "bk,bj,ji,kj,bi->ijk",
+            delta_k,
+            relu_gate_j,
+            w_ji,
+            w_kj,
+            z_i
+        )
+
+        # interactionをsoloから分離する場合
+        interaction_grad = (
+            interaction_grad
+            - interaction_grad.mean(dim=0, keepdim=True)
+        )
+
+        current_fc.interaction_scores.grad = (
+            interaction_grad.clone()
+        )
 
 
 def train(model, device, train_loader, optimizer, criterion, epoch):
@@ -183,6 +307,26 @@ def train(model, device, train_loader, optimizer, criterion, epoch):
         output = model(data)
         loss = criterion(output, target)
         loss.backward()
+        set_custom_score_gradients(model)
+        # 各epochの最初のバッチだけ表示
+        if batch_idx == 0:
+            print(f"\n--- Epoch {epoch} second-order debug ---")
+
+            for i, fc in enumerate(model.fcList):
+                grad = fc.interaction_scores.grad
+
+                if grad is None:
+                    grad_norm = None
+                else:
+                    grad_norm = grad.norm().item()
+
+                print(
+                    f"fcList[{i}] "
+                    f"grad_norm={grad_norm}, "
+                    f"solo_mean={fc.solo_mean:.6e}, "
+                    f"interaction_mean={fc.interaction_mean:.6e}, "
+                    f"mask_diff={fc.mask_diff}"
+                )
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -241,6 +385,7 @@ def main():
                         help="linear size (default: 128)")
     parser.add_argument('--hidden-layer', type=int, default=4, metavar='N',
                         help='number of hidden layers (default: 4)')
+    parser.add_argument("--quad-scale",type=float,default=1.0)
     
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
